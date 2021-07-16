@@ -71,7 +71,9 @@ public class NacosSyncToNacosServiceImpl implements SyncService {
     private NacosServerHolder nacosServerHolder;
 
     private ConcurrentHashMap<String, TaskDO> syncTaskMap = new ConcurrentHashMap<String, TaskDO>();
-
+    private ConcurrentHashMap<String, TaskDO> syncTotalTaskMap = new ConcurrentHashMap<String, TaskDO>();
+    private int times = 1;
+    
     @PostConstruct
     public void startRetransmitter() {
         ScheduledExecutorService executorService = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
@@ -87,14 +89,21 @@ public class NacosSyncToNacosServiceImpl implements SyncService {
         executorService.scheduleWithFixedDelay(new Runnable() {
             @Override
             public void run() {
+            	ConcurrentHashMap<String, TaskDO> lastSyncTaskMap = null;
                 if (syncTaskMap.size() == 0) {
-                    return;
+                	times++;
+                	if (times < 10) {
+                		return;
+                	}
+                	// 连续5分钟（30秒*10次）没有同步任务请求时，执行一次全量同步以避免注册中心注册的实例数量与实际不符
+                	lastSyncTaskMap = syncTotalTaskMap;
+                } else {
+                	lastSyncTaskMap = syncTaskMap;
                 }
-
+                
+                times = 0;
+                syncTaskMap = new ConcurrentHashMap<String, TaskDO>();
                 try {                    
-                    ConcurrentHashMap<String, TaskDO> lastSyncTaskMap = syncTaskMap;
-                    syncTaskMap = new ConcurrentHashMap<String, TaskDO>();
-                    
                     for (TaskDO taskDO : lastSyncTaskMap.values()) {
                         String taskId = taskDO.getTaskId();
                         NamingService sourceNamingService =
@@ -121,7 +130,7 @@ public class NacosSyncToNacosServiceImpl implements SyncService {
                     log.warn("retransmit event error", e);
                 }
             }
-        }, 0, 30, TimeUnit.SECONDS);
+        }, 30, 30, TimeUnit.SECONDS);
     }
 
     @Override
@@ -136,7 +145,7 @@ public class NacosSyncToNacosServiceImpl implements SyncService {
                     listenerMap.remove(taskDO.getTaskId()));
             sourceInstanceSnapshot.remove(taskDO.getTaskId());
             syncTaskMap.remove(taskDO.getTaskId());
-
+            syncTotalTaskMap.remove(taskDO.getTaskId());
             // 删除目标集群中同步的实例列表
             List<Instance> sourceInstances = sourceNamingService
                 .getAllInstances(taskDO.getServiceName(), getGroupNameOrDefault(taskDO.getGroupName()),
@@ -166,6 +175,7 @@ public class NacosSyncToNacosServiceImpl implements SyncService {
                     // 大规模重启服务实例时会产生大量重复的同步任务，对重复的同步任务进行合并以降低对Nacos注册中心的冲击
                     try {                        
                         syncTaskMap.put(taskId, taskDO);
+                        syncTotalTaskMap.put(taskId, taskDO);
                     } catch (Exception e) {
                         log.error("event process fail, taskId:{}", taskId, e);
                         metricsManager.recordError(MetricsStatisticsType.SYNC_ERROR);
